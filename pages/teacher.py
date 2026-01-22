@@ -5,11 +5,13 @@
 • "새로고침" 버튼 → 최신 데이터 즉시 갱신
 • 학번(부분) 검색, 최근 N일 필터, CSV 다운로드
 • (추가) 통계: 총 제출 수, 고유 학생 수, 문항별 O 비율
+• (추가) 시각화: 문항별 정답률 막대그래프 (Altair 적용)
 • (추가) 개인별 피드백 조회: 특정 학번의 제출 이력 확인
 """
 
 import streamlit as st
 import pandas as pd
+import altair as alt  # 시각화를 위해 추가
 from supabase import create_client, Client
 from datetime import datetime, timedelta, timezone
 
@@ -23,24 +25,26 @@ if password != "1234":  # 원하는 비밀번호로 변경하세요
     st.stop()  # 암호가 틀리면 여기서 코드 실행 중단
 
 # =========================================================
-# 1) Supabase 연결 (MySQL의 init_db() 대응)
+# 1) Supabase 연결
 # =========================================================
 @st.cache_resource
 def get_supabase_client() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]  # 교사용 로컬 대시보드: 서버/로컬에만 보관
-    return create_client(url, key)
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+        return create_client(url, key)
+    except Exception:
+        st.error("Supabase 연결 설정(secrets)을 확인해주세요.")
+        st.stop()
 
 # =========================================================
-# 2) 데이터 로드 (MySQL의 fetch_data(query, params) 대응)
-#    - Supabase는 SQL 문자열 대신 "쿼리 빌더 체이닝" 사용
+# 2) 데이터 로드
 # =========================================================
 @st.cache_data(show_spinner=False, ttl=30)
 def fetch_data(search_id: str, days: int) -> pd.DataFrame:
     try:
         supabase = get_supabase_client()
 
-        # 컬럼 선택: 필요시 guideline_1~3, model도 추가 가능
         q = (
             supabase.table("student_submissions")
             .select(
@@ -53,7 +57,7 @@ def fetch_data(search_id: str, days: int) -> pd.DataFrame:
         if search_id:
             q = q.ilike("student_id", f"%{search_id}%")
 
-        # 최근 N일 필터 (created_at 기준)
+        # 최근 N일 필터
         if days and days > 0:
             date_from = datetime.now(timezone.utc) - timedelta(days=int(days))
             q = q.gte("created_at", date_from.isoformat())
@@ -65,20 +69,18 @@ def fetch_data(search_id: str, days: int) -> pd.DataFrame:
         rows = res.data or []
         df = pd.DataFrame(rows)
 
-        # created_at을 datetime으로 변환(통계/정렬에 유용)
         if not df.empty and "created_at" in df.columns:
             df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
 
         return df
 
     except Exception as e:
-        # RLS/키/테이블명 문제 등은 여기로 잡힙니다.
         st.error(f"Supabase 조회 오류: {e}")
         return pd.DataFrame()
 
 @st.cache_data(show_spinner=False, ttl=30)
 def fetch_student_history(student_id: str, limit: int = 200) -> pd.DataFrame:
-    """특정 학번의 제출 이력을 별도로 조회(개인별 피드백 조회용)."""
+    """특정 학번의 제출 이력을 별도로 조회"""
     try:
         supabase = get_supabase_client()
         q = (
@@ -118,7 +120,7 @@ with col3:
 df = fetch_data(search_id=search_id.strip(), days=int(days))
 
 # =========================================================
-# 4) 상단 통계(전체/학생 수/문항별 O 비율)
+# 4) 상단 통계(전체/학생 수/문항별 O 비율) + 그래프
 # =========================================================
 st.write(f"**총 {len(df)} 건** 표시 중")
 
@@ -128,27 +130,68 @@ else:
     unique_students = df["student_id"].nunique() if "student_id" in df.columns else 0
     latest_time = df["created_at"].max() if "created_at" in df.columns else None
 
+    # 기본 메트릭 표시
     c1, c2, c3 = st.columns(3)
     c1.metric("총 제출 수", f"{len(df)}")
     c2.metric("고유 학생 수", f"{unique_students}")
     c3.metric("최신 제출", f"{latest_time}" if latest_time is not None else "-")
 
-    # 문항별 정답(O) 비율 (feedback_i가 "O:"로 시작하는 비율)
+    # ---------------------------------------------------------
+    # [수정됨] 정답률 계산 로직
+    # ---------------------------------------------------------
     def o_rate(series: pd.Series) -> float:
         if series is None or series.empty:
             return 0.0
         s = series.fillna("").astype(str)
+        # "O:"로 시작하는 건수를 전체 건수로 나눔
         return (s.str.startswith("O:").sum() / len(s)) * 100.0
 
     r1 = o_rate(df.get("feedback_1"))
     r2 = o_rate(df.get("feedback_2"))
     r3 = o_rate(df.get("feedback_3"))
 
-    st.markdown("#### ✅ 문항별 O 비율(전체 표시 범위 기준)")
-    s1, s2, s3 = st.columns(3)
-    s1.metric("문항 1", f"{r1:.1f}%")
-    s2.metric("문항 2", f"{r2:.1f}%")
-    s3.metric("문항 3", f"{r3:.1f}%")
+    st.markdown("---")
+    st.markdown("#### ✅ 문항별 정답률 (O 비율)")
+
+    # ---------------------------------------------------------
+    # [추가됨] 시각화: Altair 막대그래프
+    # ---------------------------------------------------------
+    
+    # 그래프를 그리기 위한 데이터프레임 생성
+    chart_df = pd.DataFrame({
+        "문항": ["문항 1", "문항 2", "문항 3"],
+        "정답률": [r1, r2, r3]
+    })
+
+    # Altair 차트 생성
+    # 1. 막대 그래프 (Y축 범위를 0~100으로 고정하여 왜곡 방지)
+    bar_chart = alt.Chart(chart_df).mark_bar().encode(
+        x=alt.X('문항', axis=alt.Axis(labelAngle=0, title=None)), # X축 라벨 회전 방지
+        y=alt.Y('정답률', scale=alt.Scale(domain=[0, 100]), title="정답률 (%)"), # 0~100 고정
+        color=alt.Color('문항', legend=None), # 문항별 다른 색상
+        tooltip=['문항', alt.Tooltip('정답률', format='.1f')] # 마우스 오버 시 수치 표시
+    ).properties(
+        height=300 # 그래프 높이 설정
+    )
+
+    # 2. 막대 위에 텍스트(숫자) 표시
+    text_labels = bar_chart.mark_text(
+        align='center',
+        baseline='bottom',
+        dy=-5,  # 막대 위로 살짝 띄움
+        fontSize=14
+    ).encode(
+        text=alt.Text('정답률', format='.1f')
+    )
+
+    # 차트와 텍스트 결합 후 출력
+    st.altair_chart(bar_chart + text_labels, use_container_width=True)
+
+    # (기존 텍스트 메트릭도 작게 표시하고 싶다면 아래 주석 해제)
+    # s1, s2, s3 = st.columns(3)
+    # s1.metric("문항 1", f"{r1:.1f}%")
+    # s2.metric("문항 2", f"{r2:.1f}%")
+    # s3.metric("문항 3", f"{r3:.1f}%")
 
     # =========================================================
     # 5) 전체 목록 표시 + CSV 다운로드
@@ -156,7 +199,6 @@ else:
     st.markdown("---")
     st.subheader("📄 전체 제출 목록")
 
-    # 화면 가독성을 위해 컬럼 순서 정리
     show_cols = [
         "student_id", "created_at",
         "answer_1", "answer_2", "answer_3",
@@ -180,7 +222,6 @@ else:
     st.markdown("---")
     st.subheader("🔎 개인별 피드백 조회")
 
-    # 현재 필터 범위 내 학생 목록에서 선택(원하면 직접 입력으로 바꿔도 됨)
     student_list = sorted(df["student_id"].dropna().astype(str).unique().tolist())
     selected = st.selectbox("학번 선택", options=student_list)
 
