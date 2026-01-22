@@ -9,12 +9,12 @@
 
 ```mermaid
 graph TD
-    User([👤 학생]) -->|1. 답안 작성 & 제출| App[💻 Streamlit App]
+    User(["👤 학생"]) -->|"1. 답안 작성 & 제출"| App["💻 Streamlit App"]
     
     subgraph "Backend Process"
-        App -->|2. 프롬프트 전송| AI[🧠 OpenAI API (GPT-4o)]
-        AI -->|3. 채점 결과 반환| App
-        App -->|4. 데이터 저장| DB[(🗄️ Supabase)]
+        App -->|"2. 프롬프트 전송"| AI["🧠 OpenAI API (GPT-4o)"]
+        AI -->|"3. 채점 결과 반환"| App
+        App -->|"4. 데이터 저장"| DB[("🗄️ Supabase")]
     end
     
-    App -->|5. 실시간 피드백 표시| User
+    App -->|"5. 실시간 피드백 표시"| User
